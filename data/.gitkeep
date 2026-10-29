@@ -1,0 +1,278 @@
+let csrfToken = '';
+
+const authScreen = document.getElementById('auth-screen');
+const dashboardScreen = document.getElementById('dashboard-screen');
+const loginForm = document.getElementById('admin-login-form');
+const loginStatus = document.getElementById('admin-login-status');
+const statusFilter = document.getElementById('status-filter');
+const searchInput = document.getElementById('search-input');
+const summaryGrid = document.getElementById('summary-grid');
+const submissionsBody = document.getElementById('submissions-body');
+const modal = document.getElementById('detail-modal');
+const modalContent = document.getElementById('modal-content');
+
+const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#039;'
+}[char]));
+
+const renderStatusBadge = (status) => {
+  const normalized = String(status || 'new').replace(/\s+/g, '_');
+  return `<span class="status-badge status-${normalized}">${normalized.replace(/_/g, ' ')}</span>`;
+};
+
+async function fetchCsrfToken() {
+  const response = await fetch('/api/csrf-token', { credentials: 'same-origin' });
+  const result = await response.json();
+  csrfToken = result.csrfToken || '';
+}
+
+async function checkAuth() {
+  try {
+    const response = await fetch('/api/dashboard', { credentials: 'same-origin' });
+    if (response.ok) {
+      authScreen.classList.remove('active');
+      dashboardScreen.classList.add('active');
+      await loadDashboard();
+      return;
+    }
+  } catch (error) {
+    console.warn('Auth check skipped:', error.message);
+  }
+
+  authScreen.classList.add('active');
+  dashboardScreen.classList.remove('active');
+}
+
+async function loadDashboard() {
+  try {
+    const params = new URLSearchParams();
+    if (statusFilter.value && statusFilter.value !== 'all') params.set('status', statusFilter.value);
+    if (searchInput.value.trim()) params.set('search', searchInput.value.trim());
+
+    const response = await fetch(`/api/submissions?${params.toString()}`, { credentials: 'same-origin' });
+    if (!response.ok) {
+      throw new Error('Unable to load submissions.');
+    }
+
+    const submissions = await response.json();
+
+    const statsResponse = await fetch('/api/dashboard', { credentials: 'same-origin' });
+    const statsResult = await statsResponse.json();
+    const stats = statsResult.stats || { total: 0, new: 0, reviewed: 0 };
+
+    summaryGrid.innerHTML = '';
+    [
+      { label: 'Total submissions', value: stats.total },
+      { label: 'New submissions', value: stats.new },
+      { label: 'Reviewed submissions', value: stats.reviewed },
+    ].forEach((card) => {
+      const item = document.createElement('div');
+      item.className = 'summary-card';
+      item.innerHTML = `<span>${card.label}</span><strong>${card.value}</strong>`;
+      summaryGrid.appendChild(item);
+    });
+
+    if (!submissions.length) {
+      submissionsBody.innerHTML = '<tr><td colspan="6">No submissions match the current filters.</td></tr>';
+      return;
+    }
+
+    submissionsBody.innerHTML = submissions.map((submission) => `
+      <tr>
+        <td>${escapeHtml(submission.full_name)}</td>
+        <td>${escapeHtml(submission.email)}</td>
+        <td>${escapeHtml(submission.county)}</td>
+        <td>${renderStatusBadge(submission.status)}</td>
+        <td>${new Date(submission.created_at).toLocaleString()}</td>
+        <td>
+          <div class="action-row">
+            <button class="btn btn-secondary tiny-btn" data-action="view" data-id="${submission.id}">View</button>
+            <button class="btn btn-primary tiny-btn" data-action="update" data-id="${submission.id}">Update</button>
+            <button class="btn btn-secondary tiny-btn" data-action="delete" data-id="${submission.id}">Delete</button>
+          </div>
+        </td>
+      </tr>
+    `).join('');
+
+    submissionsBody.querySelectorAll('button[data-action]').forEach((button) => {
+      button.addEventListener('click', async (event) => {
+        const action = event.currentTarget.dataset.action;
+        const id = Number(event.currentTarget.dataset.id);
+
+        if (action === 'view') await openSubmission(id);
+        if (action === 'update') await openSubmission(id, true);
+        if (action === 'delete') {
+          if (!window.confirm('Delete this submission permanently?')) return;
+          await deleteSubmission(id);
+        }
+      });
+    });
+  } catch (error) {
+    console.error('Dashboard load error:', error);
+    submissionsBody.innerHTML = '<tr><td colspan="6">Unable to load submissions.</td></tr>';
+  }
+}
+
+async function openSubmission(id, allowEdit = false) {
+  const response = await fetch(`/api/submission/${id}`, { credentials: 'same-origin' });
+  const submission = await response.json();
+
+  if (!response.ok) {
+    alert(submission.error || 'Unable to load submission.');
+    return;
+  }
+
+  const statusEditor = allowEdit ? `
+    <div class="field-group">
+      <label for="modal-status">Status</label>
+      <select id="modal-status">
+        <option value="new" ${submission.status === 'new' ? 'selected' : ''}>New</option>
+        <option value="under_review" ${submission.status === 'under_review' ? 'selected' : ''}>Under review</option>
+        <option value="accepted" ${submission.status === 'accepted' ? 'selected' : ''}>Accepted</option>
+        <option value="rejected" ${submission.status === 'rejected' ? 'selected' : ''}>Rejected</option>
+      </select>
+    </div>
+    <div class="field-group">
+      <label for="modal-note">Admin note</label>
+      <textarea id="modal-note" rows="4">${escapeHtml(submission.admin_note || '')}</textarea>
+    </div>
+    <button id="save-status-btn" class="btn btn-primary">Save status</button>
+  ` : '';
+
+  modalContent.innerHTML = `
+    <div class="details-grid">
+      <div class="detail-item"><span>Name</span><strong>${escapeHtml(submission.full_name)}</strong></div>
+      <div class="detail-item"><span>Email</span><strong>${escapeHtml(submission.email)}</strong></div>
+      <div class="detail-item"><span>Phone</span><strong>${escapeHtml(submission.phone || 'Not provided')}</strong></div>
+      <div class="detail-item"><span>County</span><strong>${escapeHtml(submission.county)}</strong></div>
+      <div class="detail-item"><span>Consent</span><strong>${submission.consent ? 'Granted' : 'Not granted'}</strong></div>
+      <div class="detail-item"><span>Status</span><strong>${renderStatusBadge(submission.status)}</strong></div>
+      <div class="detail-item"><span>Submitted</span><strong>${new Date(submission.created_at).toLocaleString()}</strong></div>
+      <div class="detail-item"><span>Updated</span><strong>${new Date(submission.updated_at).toLocaleString()}</strong></div>
+    </div>
+
+    <div class="detail-item">
+      <span>Message</span>
+      <p>${escapeHtml(submission.message)}</p>
+    </div>
+
+    ${statusEditor}
+  `;
+
+  if (allowEdit) {
+    document.getElementById('save-status-btn').addEventListener('click', async () => {
+      const status = document.getElementById('modal-status').value;
+      const adminNote = document.getElementById('modal-note').value;
+
+      const updateResponse = await fetch(`/api/submission/${submission.id}/status`, {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'CSRF-Token': csrfToken,
+        },
+        body: JSON.stringify({ status, admin_note: adminNote }),
+      });
+
+      const updateResult = await updateResponse.json();
+      if (!updateResponse.ok) {
+        alert(updateResult.error || 'Unable to update submission.');
+        return;
+      }
+
+      modal.classList.remove('show');
+      await loadDashboard();
+    });
+  }
+
+  modal.classList.add('show');
+}
+
+async function deleteSubmission(id) {
+  const response = await fetch(`/api/submission/${id}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: {
+      'CSRF-Token': csrfToken,
+    },
+  });
+
+  const result = await response.json();
+  if (!response.ok) {
+    alert(result.error || 'Unable to delete submission.');
+    return;
+  }
+
+  await loadDashboard();
+}
+
+loginForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+
+  const payload = {
+    username: document.getElementById('admin-username').value,
+    password: document.getElementById('admin-password').value,
+  };
+
+  try {
+    await fetchCsrfToken();
+    const response = await fetch('/api/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'CSRF-Token': csrfToken,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const result = await response.json();
+
+    if (!response.ok) {
+      loginStatus.textContent = result.error || 'Login failed.';
+      loginStatus.className = 'form-status error';
+      return;
+    }
+
+    loginStatus.textContent = result.message || 'Login successful.';
+    loginStatus.className = 'form-status success';
+    authScreen.classList.remove('active');
+    dashboardScreen.classList.add('active');
+    await loadDashboard();
+  } catch (error) {
+    console.error('Admin login failed:', error);
+    loginStatus.textContent = 'Unable to sign in. Please try again.';
+    loginStatus.className = 'form-status error';
+  }
+});
+
+document.getElementById('logout-btn').addEventListener('click', async () => {
+  await fetch('/api/logout', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {
+      'CSRF-Token': csrfToken,
+    },
+  });
+
+  authScreen.classList.add('active');
+  dashboardScreen.classList.remove('active');
+  loginForm.reset();
+});
+
+document.getElementById('refresh-btn').addEventListener('click', loadDashboard);
+document.getElementById('close-modal').addEventListener('click', () => modal.classList.remove('show'));
+statusFilter.addEventListener('change', loadDashboard);
+searchInput.addEventListener('input', loadDashboard);
+document.getElementById('export-btn').addEventListener('click', () => {
+  window.location.href = '/api/submissions/export.csv';
+});
+
+(async () => {
+  await fetchCsrfToken();
+  await checkAuth();
+})();
